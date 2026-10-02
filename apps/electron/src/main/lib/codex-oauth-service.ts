@@ -100,6 +100,7 @@ export async function loginCodexOAuth(options?: CodexLoginOptions): Promise<Code
     return await runWithOAuthProxyScope(async () => {
       const runtime = await sdk.ModelRuntime.create({
         credentials: createEphemeralCredentialStore(),
+        modelsPath: null,
         allowModelNetwork: false,
       })
       const credentials = await runtime.login('openai-codex', 'oauth', {
@@ -154,7 +155,7 @@ export async function refreshCodexOAuth(refreshToken: string): Promise<CodexOAut
       refresh: refreshToken,
       expires: 0,
     })
-    const runtime = await sdk.ModelRuntime.create({ credentials: store, allowModelNetwork: false })
+    const runtime = await sdk.ModelRuntime.create({ credentials: store, modelsPath: null, refreshOnCreate: false, allowModelNetwork: false })
     // getAuth() 走 provider 的标准 refresh 流程，并通过 store 原子更新凭据。
     await runtime.getAuth('openai-codex')
     return normalizeCredentials(await store.read())

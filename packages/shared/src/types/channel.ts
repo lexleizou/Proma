@@ -523,9 +523,24 @@ export interface ChannelPlanQuotaResult {
 /**
  * 渠道相关 IPC 通道常量
  */
+/** 按需刷新失败的信息；不包含凭据或供应商原始错误。 */
+export interface SubscriptionModelRefreshIssue {
+  channelId: string
+  channelName: string
+  message: string
+  requiresAuthorization: boolean
+}
+
+export interface SubscriptionModelRefreshResult {
+  channels: Channel[]
+  issues: SubscriptionModelRefreshIssue[]
+}
+
 export const CHANNEL_IPC_CHANNELS = {
   /** 获取所有渠道列表 */
   LIST: 'channel:list',
+  /** 打开设置或模型选择器时检查订阅目录；不启动交互式登录。 */
+  REFRESH_SUBSCRIPTION_MODELS: 'channel:refresh-subscription-models',
   /** 创建渠道 */
   CREATE: 'channel:create',
   /** 更新渠道 */
