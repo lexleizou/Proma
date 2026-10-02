@@ -25,6 +25,7 @@ import type {
   XaiOAuthCredentials,
   FetchModelsInput,
   FetchModelsResult,
+  SubscriptionModelRefreshResult,
   ProviderType,
 } from '@proma/shared'
 import {
@@ -60,6 +61,14 @@ import {
 } from '@proma/core'
 import { normalizeHttpResponse, normalizeRequestError } from './channel-test-error'
 import { writeJsonFileAtomic } from './safe-file'
+import {
+  appendSubscriptionModels,
+  createSubscriptionModelRefresher,
+  isRefreshableSubscription,
+  isSubscriptionAuthorizationFailure,
+  SubscriptionAuthorizationError,
+  SubscriptionSecureStorageError,
+} from './subscription-model-refresh'
 import pkg from '../../../package.json' with { type: 'json' }
 
 /** 当前配置版本 */
@@ -606,17 +615,25 @@ export function decryptApiKey(channelId: string): string {
 const inflightCodexRefresh = new Map<string, Promise<CodexOAuthCredentials>>()
 
 /** 保存 Pi 或 Proma 刷新后的完整 Codex OAuth 凭据。 */
-export function persistCodexOAuthCredentials(channelId: string, credentials: CodexOAuthCredentials): void {
+export function persistCodexOAuthCredentials(
+  channelId: string,
+  credentials: CodexOAuthCredentials,
+  expectedCredentials?: CodexOAuthCredentials,
+): void {
   const channel = getChannelById(channelId)
   if (!channel || channel.provider !== 'openai-codex') {
     throw new Error(`Codex 渠道不存在或类型不匹配: ${channelId}`)
   }
 
   const existing = parseCodexCredentials(decryptKey(channel.apiKey))
+  if (expectedCredentials && (!existing || serializeCodexCredentials(existing) !== serializeCodexCredentials(expectedCredentials))) {
+    return // 刷新期间重新授权后，旧账号的响应不可覆盖新凭据。
+  }
   const merged = {
     ...credentials,
     accountId: credentials.accountId ?? existing?.accountId,
   }
+  if (expectedCredentials && !safeStorage.isEncryptionAvailable()) throw new SubscriptionSecureStorageError()
   updateChannel(channelId, { apiKey: serializeCodexCredentials(merged) })
 }
 
@@ -650,7 +667,7 @@ export async function resolveCodexOAuthCredentials(channelId: string): Promise<C
         ...refreshed,
         accountId: refreshed.accountId ?? credentials.accountId,
       }
-      persistCodexOAuthCredentials(channelId, merged)
+      persistCodexOAuthCredentials(channelId, merged, credentials)
       return merged
     } finally {
       inflightCodexRefresh.delete(channelId)
@@ -1849,6 +1866,80 @@ export async function testChannelDirect(input: ChannelDirectTestInput): Promise<
 }
 
 // ===== 模型拉取相关 =====
+
+const subscriptionModelRefresher = createSubscriptionModelRefresher({
+  async load(channel) {
+    if (!safeStorage.isEncryptionAvailable()) throw new SubscriptionSecureStorageError()
+    try {
+      const secret = decryptKey(channel.apiKey)
+      if (channel.provider === 'github-copilot') {
+        const credentials = parseGithubCopilotCredentials(secret)
+        if (!credentials) throw new SubscriptionAuthorizationError()
+        const refreshed = await refreshGithubCopilotOAuth(credentials, true)
+        // getAvailable 只返回当前账号策略允许且 Pi runtime 支持的模型。
+        const models = await listGithubCopilotModels(refreshed)
+        return {
+          models: models.map((model) => ({ ...model, enabled: true })),
+          refreshedSecret: serializeGithubCopilotCredentials(refreshed),
+        }
+      }
+      const credentials = parseCodexCredentials(secret)
+      if (!credentials) throw new SubscriptionAuthorizationError()
+      const models = await listCodexModels()
+      if (models.length === 0) throw new Error('Pi runtime 未提供兼容的 Codex 目录')
+      let expectedApiKey = channel.apiKey
+      if (isCodexCredentialExpired(credentials) && getChannelById(channel.id)?.apiKey === channel.apiKey) {
+        // 复用已有串行续期，避免与正在执行的会话重复消费 rotating refresh token。
+        const refreshed = await resolveCodexOAuthCredentials(channel.id)
+        const current = getChannelById(channel.id)
+        const stored = current && parseCodexCredentials(decryptKey(current.apiKey))
+        if (current && stored && serializeCodexCredentials(stored) === serializeCodexCredentials(refreshed)) {
+          expectedApiKey = current.apiKey
+        }
+      }
+      return { models: models.map((model) => ({ ...model, enabled: true })), expectedApiKey }
+    } catch (error) {
+      // 不记录供应商原始错误，避免其响应包含 token；只区分需要重新授权的明确错误。
+      if (error instanceof SubscriptionSecureStorageError) throw error
+      if (isSubscriptionAuthorizationFailure(error)) {
+        throw new SubscriptionAuthorizationError()
+      }
+      throw new Error('订阅目录更新失败')
+    }
+  },
+  commit(snapshot, loaded) {
+    // await 期间可能切换账号、删除渠道或修改 enabled。只在凭据仍匹配时提交，
+    // 并基于最新 models 合并，绝不覆盖用户在请求期间的操作。
+    const config = readConfig()
+    const index = config.channels.findIndex((channel) => channel.id === snapshot.id)
+    const current = config.channels[index]
+    if (!current || current.provider !== snapshot.provider || current.apiKey !== (loaded.expectedApiKey ?? snapshot.apiKey)) return undefined
+    const models = appendSubscriptionModels(current.models, loaded.models)
+    const secretChanged = loaded.refreshedSecret !== undefined && loaded.refreshedSecret !== decryptKey(current.apiKey)
+    if (models.length === current.models.length && !secretChanged) return current
+    if (secretChanged && !safeStorage.isEncryptionAvailable()) throw new SubscriptionSecureStorageError()
+    const updated: Channel = {
+      ...current,
+      models,
+      apiKey: secretChanged ? encryptApiKey(loaded.refreshedSecret!) : current.apiKey,
+      updatedAt: Date.now(),
+    }
+    config.channels[index] = updated
+    writeConfig(config)
+    return updated
+  },
+})
+
+/** UI 显式打开时按需检查；普通 listChannels、自动化和后台启动不会触发网络请求。 */
+export async function refreshSubscriptionModels(channelIds?: string[], force = false): Promise<SubscriptionModelRefreshResult> {
+  const selected = channelIds ? new Set(channelIds) : undefined
+  const channels = listChannels().filter((channel) => isRefreshableSubscription(channel)
+    && (selected ? selected.has(channel.id) : channel.enabled))
+  // 绕过缓存只用于用户显式点击「获取模型」；自动打开不会重试失效授权。
+  if (force) for (const channel of channels) subscriptionModelRefresher.invalidate(channel.id)
+  const issues = await Promise.all(channels.map((channel) => subscriptionModelRefresher.refresh(channel)))
+  return { channels: listChannels(), issues: issues.filter((issue) => issue !== undefined) }
+}
 
 /**
  * 从供应商 API 拉取可用模型列表

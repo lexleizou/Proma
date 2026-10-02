@@ -33,6 +33,7 @@ import type { Api, KnownProvider, Model } from '@earendil-works/pi-ai/compat'
 import type { PiAgentQueryOptions } from './pi-agent-adapter'
 import { rememberXaiOAuthCredentials, refreshXaiOAuthCredentialsSerial } from '../xai-oauth-credentials'
 import { supportsPiDeveloperRole } from './pi-provider-compat'
+import { isCompatibleCodexCatalogModel } from './pi-codex-catalog-compat'
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 type PiAiCompat = typeof import('@earendil-works/pi-ai/compat')
@@ -378,7 +379,16 @@ const CODEX_MODEL_PATCHES: PiCatalogModelPatch[] = [
   },
   {
     id: 'gpt-5.5',
+    name: 'GPT-5.5',
+    api: 'openai-codex-responses',
+    provider: 'openai-codex',
+    baseUrl: CODEX_BASE_URL,
+    reasoning: true,
+    thinkingLevelMap: compilePiReasoningCapabilities('openai-responses', 'gpt-5.5')?.thinkingLevelMap,
+    input: ['text', 'image'],
+    cost: ZERO_MODEL_COST,
     contextWindow: CODEX_GPT_54_55_CONTEXT_WINDOW,
+    maxTokens: CODEX_MAX_TOKENS,
   },
   {
     id: 'gpt-5.6-sol',
@@ -825,7 +835,7 @@ function isCompleteCatalogModel(model: PiCatalogModelPatch): model is PiCatalogM
 
 export async function getCodexCatalogModels(): Promise<PiCatalogModel[]> {
   const { getModels } = await loadPiAiCompat()
-  return mergeCodexModels(getModels('openai-codex'))
+  return mergeCodexModels(getModels('openai-codex')).filter(isCompatibleCodexCatalogModel)
 }
 
 /**
@@ -847,16 +857,17 @@ export async function buildCodexModel(sdk: PiSdk, input: CodexModelInput) {
       input.codexOAuthCredentials,
       input.onCodexOAuthCredentialsRefreshed,
     ),
+    modelsPath: null,
     allowModelNetwork: false,
   })
 
   const resolvedModelId = stripLegacyAgentSdkContextSuffix(input.model)
-  const runtimeModels = modelRuntime.getModels('openai-codex')
+  const runtimeModels = modelRuntime.getModels('openai-codex').filter(isCompatibleCodexCatalogModel)
   const codexModels = await getCodexCatalogModels()
   const model = resolvedModelId
     ? runtimeModels.find((candidate) => candidate.id === resolvedModelId)
       ?? findCatalogModelById(codexModels, resolvedModelId)
-    : runtimeModels[0]
+    : runtimeModels[0] ?? codexModels[0]
 
   if (!model) {
     if (resolvedModelId) {
@@ -929,6 +940,7 @@ export async function buildGithubCopilotModel(sdk: PiSdk, input: GithubCopilotMo
       input.githubCopilotOAuthCredentials,
       input.onGithubCopilotOAuthCredentialsRefreshed,
     ),
+    modelsPath: null,
     allowModelNetwork: false,
   })
   const resolvedModelId = stripLegacyAgentSdkContextSuffix(input.model)
@@ -946,7 +958,12 @@ export async function buildGithubCopilotModel(sdk: PiSdk, input: GithubCopilotMo
 /** 列出当前 GitHub Copilot 凭据实际允许使用的模型。 */
 export async function listGithubCopilotModels(credentials: GithubCopilotOAuthCredentials): Promise<{ id: string; name: string }[]> {
   const sdk = await import('@earendil-works/pi-coding-agent')
-  const { modelRuntime } = await buildGithubCopilotModel(sdk, { githubCopilotOAuthCredentials: credentials })
+  const modelRuntime = await sdk.ModelRuntime.create({
+    credentials: createGithubCopilotRuntimeCredentialStore(credentials),
+    modelsPath: null,
+    allowModelNetwork: false,
+  })
+  // 没有账号可用模型也是有效目录，不应通过 buildModel 的非空检查把它误判为失败。
   return (await modelRuntime.getAvailable('github-copilot')).map((model) => ({ id: model.id, name: model.name }))
 }
 

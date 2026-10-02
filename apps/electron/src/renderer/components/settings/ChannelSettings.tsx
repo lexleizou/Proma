@@ -26,6 +26,7 @@ import {
   AlertDialogTitle,
 } from '@/components/ui/alert-dialog'
 import { ChannelForm } from './ChannelForm'
+import { getSubscriptionChannelIds, showSubscriptionModelRefreshIssues } from '@/lib/subscription-model-refresh'
 
 /** 组件视图模式 */
 type ViewMode = 'list' | 'create' | 'edit'
@@ -53,14 +54,26 @@ export function ChannelSettings(): React.ReactElement {
       const list = await window.electronAPI.listChannels()
       setChannels(list)
       setGlobalChannels(list) // 同步到全局缓存
-      return list
+      setLoading(false) // 无需等待网络即可编辑已有配置
+      const ids = getSubscriptionChannelIds(list)
+      if (ids.length === 0) return list
+      try {
+        const result = await window.electronAPI.refreshSubscriptionModels(ids)
+        setChannels(result.channels)
+        setGlobalChannels(result.channels)
+        showSubscriptionModelRefreshIssues(result)
+        return result.channels
+      } catch {
+        // IPC 异常也不清空已经显示的列表。
+        return list
+      }
     } catch (error) {
       console.error('[渠道设置] 加载渠道列表失败:', error)
       return []
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [setGlobalChannels])
 
   React.useEffect(() => {
     loadChannels()
