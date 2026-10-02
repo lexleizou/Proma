@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import type { Api, Model } from '@earendil-works/pi-ai/compat'
-import { isCompatibleCodexCatalogModel } from './pi-codex-catalog-compat'
+import { isCompatibleCodexCatalogModel, withLocalCodexSolCompatibility } from './pi-codex-catalog-compat'
 import { buildCodexModel, getCodexCatalogModels, listCodexModels } from './pi-model-registry'
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
@@ -16,6 +16,24 @@ function runtimeSdk(models: Model<Api>[]): PiSdk {
 }
 
 describe('Codex 目录运行时兼容性', () => {
+  test('Given 捆绑 Sol 目录 When 添加本机兼容项 Then 不修改原模型且完整复制工具元数据', () => {
+    const snapshot = JSON.stringify(model)
+    const catalog = withLocalCodexSolCompatibility([model])
+    expect(catalog).toHaveLength(2)
+    expect(JSON.stringify(model)).toBe(snapshot)
+    expect(catalog[1]?.id).toBe('gpt-6.1-sol')
+  })
+  test('Given 原生目录已有本机模型 ID When 应用兼容项 Then 不覆盖原生新元数据', () => {
+    const native = { ...model, id: 'gpt-6.1-sol', name: 'Native Sol', contextWindow: 512000 }
+    const catalog = withLocalCodexSolCompatibility([model, native])
+    expect(catalog).toHaveLength(2)
+    expect(catalog[1]).toBe(native)
+  })
+  test('Given 无捆绑 Sol 或其协议无效 When 添加兼容项 Then 不捏造运行时模型', () => {
+    expect(withLocalCodexSolCompatibility([])).toEqual([])
+    const invalid = { ...model, api: 'openai-responses' as const }
+    expect(withLocalCodexSolCompatibility([invalid])).toEqual([invalid])
+  })
   test('Given 正确的 Codex 协议和元数据 When 校验 Then 接受模型', () => {
     expect(isCompatibleCodexCatalogModel(model)).toBe(true)
   })
@@ -43,6 +61,23 @@ describe('Codex 目录运行时兼容性', () => {
     const result = await buildCodexModel(runtimeSdk([]), { model: 'gpt-6-sol', codexOAuthCredentials: credentials })
     expect(result.model.id).toBe('gpt-6-sol')
     expect(isCompatibleCodexCatalogModel(result.model)).toBe(true)
+  })
+  test('Given 存量本机兼容模型不在 SDK runtime When 构建 Then 使用完整 Sol 元数据及原本机能力', async () => {
+    const result = await buildCodexModel(runtimeSdk([]), { model: 'gpt-6.1-sol', codexOAuthCredentials: credentials })
+    expect(result.model).toMatchObject({
+      id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', contextWindow: 272000, maxTokens: 128000,
+      api: 'openai-codex-responses', provider: 'openai-codex', input: ['text', 'image'],
+      thinkingLevelMap: { off: 'low', minimal: 'low', low: 'low', high: 'high', max: 'max' },
+      compat: { supportsOpenAIGrammarTools: true, supportsToolSearch: true },
+      cost: { cacheRead: 0.1 },
+    })
+    expect(isCompatibleCodexCatalogModel(result.model)).toBe(true)
+    expect(result.model.inputLimits?.images?.resize).toBeDefined()
+    expect(result.model.cost.tiers?.[0]?.cacheRead).toBe(0.2)
+  })
+  test('Given 未核验的本机模型近似 ID When 构建 Then 拒绝推测其他型号', async () => {
+    await expect(buildCodexModel(runtimeSdk([]), { model: 'gpt-6.1-sol-mini', codexOAuthCredentials: credentials }))
+      .rejects.toThrow('未找到指定的 ChatGPT (Codex) 模型')
   })
   test('Given runtime 目录使用通用协议 When 选择模型 Then 保留目录优先及正确 Codex 协议', async () => {
     const result = await buildCodexModel(runtimeSdk([{ ...model, api: 'openai-responses' }]), {

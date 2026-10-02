@@ -37,7 +37,7 @@ import type { Api, KnownProvider, Model } from '@earendil-works/pi-ai/compat'
 import type { PiAgentQueryOptions } from './pi-agent-adapter'
 import { rememberXaiOAuthCredentials, refreshXaiOAuthCredentialsSerial } from '../xai-oauth-credentials'
 import { supportsPiDeveloperRole } from './pi-provider-compat'
-import { isCompatibleCodexCatalogModel } from './pi-codex-catalog-compat'
+import { isCompatibleCodexCatalogModel, withLocalCodexSolCompatibility } from './pi-codex-catalog-compat'
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 type PiAiCompat = typeof import('@earendil-works/pi-ai/compat')
@@ -861,7 +861,7 @@ function isSupportedCodexModel(model: PiCatalogModel): boolean {
 
 export async function getCodexCatalogModels(): Promise<PiCatalogModel[]> {
   const { getModels } = await loadPiAiCompat()
-  return mergeCodexModels(getModels('openai-codex')).filter(isSupportedCodexModel)
+  return mergeCodexModels(withLocalCodexSolCompatibility(getModels('openai-codex'))).filter(isSupportedCodexModel)
 }
 
 /**

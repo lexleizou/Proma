@@ -1,4 +1,4 @@
-import { isGpt6AstraFamily, isGpt6LunaFamily, isGpt6SolFamily } from '../utils/model-family'
+import { isGpt6AstraFamily, isGpt6LunaFamily, isGpt6SolFamily, isGpt61SolModel } from '../utils/model-family'
 import type { ProviderType } from './channel'
 import type { AgentThinkingLevel } from './agent'
 
@@ -359,7 +359,7 @@ export function resolveReasoningProfile(input: ResolveReasoningProfileInput): Re
   const isOpenAITransport = input.transport === 'openai-completions' || input.transport === 'openai-responses'
   const isOpenAIReasoningModel = !modelId.endsWith('-chat-latest')
     && (modelId.startsWith('gpt-5') || /^(o1|o3|o4)(?:-|$)/.test(modelId))
-  if (isGpt6AstraFamily(modelId)) {
+  if (isGpt6AstraFamily(modelId) || isGpt61SolModel(modelId)) {
     return OPENAI_ASTRA_PROFILE.encodings[input.transport] ? OPENAI_ASTRA_PROFILE : undefined
   }
   if (isGpt6SolFamily(modelId) || isGpt6LunaFamily(modelId)) {
