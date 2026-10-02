@@ -25,6 +25,7 @@ import type {
   XaiOAuthCredentials,
   FetchModelsInput,
   FetchModelsResult,
+  SubscriptionModelRefreshResult,
   ProviderType,
 } from '@proma/shared'
 import {
@@ -60,11 +61,20 @@ import {
 } from '@proma/core'
 import { normalizeHttpResponse, normalizeRequestError } from './channel-test-error'
 import { writeJsonFileAtomic } from './safe-file'
+import {
+  appendSubscriptionModels,
+  createSubscriptionModelRefresher,
+  isRefreshableSubscription,
+  isSubscriptionAuthorizationFailure,
+  SubscriptionAuthorizationError,
+  SubscriptionSecureStorageError,
+} from './subscription-model-refresh'
 import pkg from '../../../package.json' with { type: 'json' }
 
 /** 当前配置版本 */
 const CONFIG_VERSION = 7
-const RETIRED_VOLCENGINE_PROVIDERS = new Set<ProviderType>(['doubao', 'ark-coding-plan'])
+// 历史配置的原始字符串仍需迁移，但不应重新加入现行 ProviderType。
+const RETIRED_VOLCENGINE_PROVIDERS = new Set<string>(['doubao', 'ark-coding-plan'])
 const RETIRED_OPENCODE_PROVIDER = 'opencode-go-openai'
 const RETIRED_OPENCODE_MESSAGE = 'OpenCode Go 渠道已停止支持，请选择其他供应商或自定义渠道'
 
@@ -75,6 +85,8 @@ function assertSupportedProvider(provider: ProviderType): void {
 /** 连接测试 / 模型拉取的统一超时时间 */
 const CHANNEL_TEST_TIMEOUT_MS = 15_000
 // ChatGPT backend 首次经代理 / Cloudflare 建连可能超过普通模型探测的 15 秒。
+// 与 Pi 0.87.1 的 OAuth 最短有效期保持一致，避免交给 runtime 后立即重复续期。
+const PI_OAUTH_MIN_VALIDITY_MS = 5 * 60 * 1000
 const CODEX_PLAN_QUOTA_TIMEOUT_MS = 30_000
 const DEEPSEEK_PRESET_MODELS: ChannelModel[] = [
   { id: 'deepseek-v4-pro', name: 'DeepSeek V4 Pro', enabled: true },
@@ -472,8 +484,9 @@ function writeConfig(config: ChannelsConfig): void {
  *
  * @returns base64 编码的加密字符串
  */
-function encryptApiKey(plainKey: string): string {
+function encryptApiKey(plainKey: string, requireSecureStorage = false): string {
   if (!safeStorage.isEncryptionAvailable()) {
+    if (requireSecureStorage) throw new SubscriptionSecureStorageError()
     console.warn('[渠道管理] safeStorage 加密不可用，将以明文存储')
     return plainKey
   }
@@ -564,7 +577,7 @@ export function createChannel(input: ChannelCreateInput): Channel {
     name: input.name,
     provider: input.provider,
     baseUrl: input.baseUrl,
-    apiKey: encryptApiKey(input.apiKey),
+    apiKey: encryptApiKey(input.apiKey, input.provider === 'github-copilot' || input.provider === 'openai-codex'),
     models: input.models,
     enabled: input.enabled,
     createdAt: now,
@@ -601,7 +614,9 @@ export function updateChannel(id: string, input: ChannelUpdateInput): Channel {
     name: input.name ?? existing.name,
     provider: input.provider ?? existing.provider,
     baseUrl: input.baseUrl ?? existing.baseUrl,
-    apiKey: input.apiKey ? encryptApiKey(input.apiKey) : existing.apiKey,
+    apiKey: input.apiKey
+      ? encryptApiKey(input.apiKey, (input.provider ?? existing.provider) === 'github-copilot' || (input.provider ?? existing.provider) === 'openai-codex')
+      : existing.apiKey,
     models: input.models ?? existing.models,
     enabled: input.enabled ?? existing.enabled,
     updatedAt: Date.now(),
@@ -655,21 +670,35 @@ export function decryptApiKey(channelId: string): string {
  * 只有一次刷新在飞行，其余调用复用同一 Promise。对应 memory 里记过的
  * 「OAuth 刷新需并发锁」经验。
  */
-const inflightCodexRefresh = new Map<string, Promise<CodexOAuthCredentials>>()
+interface CodexRefreshEntry {
+  requestId: symbol
+  credentialKey: string
+  promise: Promise<CodexOAuthCredentials>
+}
+const inflightCodexRefresh = new Map<string, CodexRefreshEntry>()
 
 /** 保存 Pi 或 Proma 刷新后的完整 Codex OAuth 凭据。 */
-export function persistCodexOAuthCredentials(channelId: string, credentials: CodexOAuthCredentials): void {
+export function persistCodexOAuthCredentials(
+  channelId: string,
+  credentials: CodexOAuthCredentials,
+  expectedCredentials: CodexOAuthCredentials,
+): boolean {
   const channel = getChannelById(channelId)
   if (!channel || channel.provider !== 'openai-codex') {
     throw new Error(`Codex 渠道不存在或类型不匹配: ${channelId}`)
   }
 
+  if (!safeStorage.isEncryptionAvailable()) throw new SubscriptionSecureStorageError()
   const existing = parseCodexCredentials(decryptKey(channel.apiKey))
+  if (!existing || serializeCodexCredentials(existing) !== serializeCodexCredentials(expectedCredentials)) {
+    return false // 刷新期间重新授权后，旧账号的响应不可覆盖新凭据。
+  }
   const merged = {
     ...credentials,
     accountId: credentials.accountId ?? existing?.accountId,
   }
   updateChannel(channelId, { apiKey: serializeCodexCredentials(merged) })
+  return true
 }
 
 /**
@@ -688,13 +717,15 @@ export async function resolveCodexOAuthCredentials(channelId: string): Promise<C
     throw new Error('ChatGPT 登录凭据无效或缺失，请重新登录')
   }
 
-  if (!isCodexCredentialExpired(credentials)) {
+  if (!isCodexCredentialExpired(credentials, PI_OAUTH_MIN_VALIDITY_MS)) {
     return credentials
   }
 
+  const credentialKey = serializeCodexCredentials(credentials)
   const existing = inflightCodexRefresh.get(channelId)
-  if (existing) return existing
+  if (existing?.credentialKey === credentialKey) return existing.promise
 
+  const requestId = Symbol('codex-refresh')
   const refreshPromise = (async (): Promise<CodexOAuthCredentials> => {
     try {
       const refreshed = await refreshCodexOAuth(credentials.refresh)
@@ -702,14 +733,16 @@ export async function resolveCodexOAuthCredentials(channelId: string): Promise<C
         ...refreshed,
         accountId: refreshed.accountId ?? credentials.accountId,
       }
-      persistCodexOAuthCredentials(channelId, merged)
+      persistCodexOAuthCredentials(channelId, merged, credentials)
       return merged
     } finally {
-      inflightCodexRefresh.delete(channelId)
+      if (inflightCodexRefresh.get(channelId)?.requestId === requestId) {
+        inflightCodexRefresh.delete(channelId)
+      }
     }
   })()
 
-  inflightCodexRefresh.set(channelId, refreshPromise)
+  inflightCodexRefresh.set(channelId, { requestId, credentialKey, promise: refreshPromise })
   return refreshPromise
 }
 
@@ -718,8 +751,13 @@ export async function resolveCodexAccessToken(channelId: string): Promise<string
   return (await resolveCodexOAuthCredentials(channelId)).access
 }
 
-/** 同一 GitHub Copilot 渠道的 refresh 去重。 */
-const inflightGithubCopilotRefresh = new Map<string, Promise<GithubCopilotOAuthCredentials>>()
+/** 会话续期与强制策略刷新共用通道锁；重新登录后不能复用旧账号请求。 */
+interface GithubCopilotRefreshEntry {
+  requestId: symbol
+  credentialKey: string
+  promise: Promise<GithubCopilotOAuthCredentials>
+}
+const inflightGithubCopilotRefresh = new Map<string, GithubCopilotRefreshEntry>()
 
 /**
  * 条件回写刷新凭据：当前渠道仍是启动时的凭据才更新。
@@ -736,6 +774,7 @@ export function persistGithubCopilotOAuthCredentials(
   if (!channel || channel.provider !== 'github-copilot') {
     throw new Error(`GitHub Copilot 渠道不存在或类型不匹配: ${channelId}`)
   }
+  if (!safeStorage.isEncryptionAvailable()) throw new SubscriptionSecureStorageError()
   const current = parseGithubCopilotCredentials(decryptKey(channel.apiKey))
   if (!current || serializeGithubCopilotCredentials(current) !== serializeGithubCopilotCredentials(expectedCredentials)) {
     console.info(`[GitHub Copilot OAuth] 已忽略过期凭据回写: ${channelId}`)
@@ -746,27 +785,33 @@ export function persistGithubCopilotOAuthCredentials(
 }
 
 /** 解析渠道存储的 GitHub Copilot 凭据，按需刷新并条件回写。 */
-export async function resolveGithubCopilotOAuthCredentials(channelId: string): Promise<GithubCopilotOAuthCredentials> {
+export async function resolveGithubCopilotOAuthCredentials(channelId: string, force = false): Promise<GithubCopilotOAuthCredentials> {
   const channel = getChannelById(channelId)
   if (!channel || channel.provider !== 'github-copilot') {
     throw new Error('GitHub Copilot 渠道不存在或类型不匹配')
   }
   const credentials = parseGithubCopilotCredentials(decryptKey(channel.apiKey))
   if (!credentials) throw new Error('GitHub Copilot 登录凭据无效或缺失，请重新登录')
-  if (!isGithubCopilotCredentialExpired(credentials)) return credentials
-
+  const credentialKey = serializeGithubCopilotCredentials(credentials)
   const existing = inflightGithubCopilotRefresh.get(channelId)
-  if (existing) return existing
-  const refreshPromise = (async (): Promise<GithubCopilotOAuthCredentials> => {
+  // 即使当前 token 未过期，也要等待已经开始的强制策略刷新，避免会话拿到旧策略。
+  if (existing?.credentialKey === credentialKey) return existing.promise
+  if (!force && !isGithubCopilotCredentialExpired(credentials, PI_OAUTH_MIN_VALIDITY_MS)) return credentials
+
+  const requestId = Symbol('github-copilot-refresh')
+  const refreshPromise: Promise<GithubCopilotOAuthCredentials> = (async () => {
     try {
-      const refreshed = await refreshGithubCopilotOAuth(credentials)
+      const refreshed = await refreshGithubCopilotOAuth(credentials, force)
       persistGithubCopilotOAuthCredentials(channelId, refreshed, credentials)
       return refreshed
     } finally {
-      inflightGithubCopilotRefresh.delete(channelId)
+      // 旧账号请求结束时，不能释放重新登录后新账号的锁。
+      if (inflightGithubCopilotRefresh.get(channelId)?.requestId === requestId) {
+        inflightGithubCopilotRefresh.delete(channelId)
+      }
     }
   })()
-  inflightGithubCopilotRefresh.set(channelId, refreshPromise)
+  inflightGithubCopilotRefresh.set(channelId, { requestId, credentialKey, promise: refreshPromise })
   return refreshPromise
 }
 
@@ -1866,6 +1911,96 @@ export async function testChannelDirect(input: ChannelDirectTestInput): Promise<
 }
 
 // ===== 模型拉取相关 =====
+
+const subscriptionModelRefresher = createSubscriptionModelRefresher({
+  async load(channel) {
+    if (!safeStorage.isEncryptionAvailable()) throw new SubscriptionSecureStorageError()
+    try {
+      const secret = decryptKey(channel.apiKey)
+      if (channel.provider === 'github-copilot') {
+        const credentials = parseGithubCopilotCredentials(secret)
+        if (!credentials) throw new SubscriptionAuthorizationError()
+        await resolveGithubCopilotOAuthCredentials(channel.id, true)
+        // Pi utility 可能在主进程锁之外续期。同一 GitHub token + Enterprise 域名
+        // 表示同一授权：此时以已持久化的最新策略重取目录，而不是丢弃模型结果。
+        for (let attempt = 0; attempt < 3; attempt++) {
+          if (!safeStorage.isEncryptionAvailable()) throw new SubscriptionSecureStorageError()
+          const current = getChannelById(channel.id)
+          const stored = current && parseGithubCopilotCredentials(decryptKey(current.apiKey))
+          if (!current || current.provider !== channel.provider || !stored
+            || stored.refresh !== credentials.refresh
+            || (stored.enterpriseUrl ?? '') !== (credentials.enterpriseUrl ?? '')) {
+            return { models: [], discard: true } // 账号已变化，绝不套用旧目录。
+          }
+          const models = await listGithubCopilotModels(stored)
+          if (getChannelById(channel.id)?.apiKey === current.apiKey) {
+            return { models: models.map((model) => ({ ...model, enabled: true })), expectedApiKey: current.apiKey }
+          }
+        }
+        throw new Error('续期期间凭据持续变化，稍后重新读取目录')
+
+      }
+      const credentials = parseCodexCredentials(secret)
+      if (!credentials) throw new SubscriptionAuthorizationError()
+      let activeCredentials = credentials
+      let expectedApiKey = channel.apiKey
+      if (isCodexCredentialExpired(credentials, PI_OAUTH_MIN_VALIDITY_MS) && getChannelById(channel.id)?.apiKey === channel.apiKey) {
+        // 复用已有串行续期，避免与正在执行的会话重复消费 rotating refresh token。
+        const refreshed = await resolveCodexOAuthCredentials(channel.id)
+        activeCredentials = refreshed
+        const current = getChannelById(channel.id)
+        const stored = current && parseCodexCredentials(decryptKey(current.apiKey))
+        if (!current || !stored || serializeCodexCredentials(stored) !== serializeCodexCredentials(refreshed)) {
+          return { models: [], discard: true }
+        }
+        expectedApiKey = current.apiKey
+      }
+      // 等待串行续期后再读取账号目录；已换账号时不使用旧凭据继续查询。
+      if (getChannelById(channel.id)?.apiKey !== expectedApiKey) return { models: [], discard: true }
+      const models = await listCodexModels(activeCredentials)
+      // 账号暂时没有可用模型也是成功结果，仍保留用户原有配置。
+      return { models: models.map((model) => ({ ...model, enabled: true })), expectedApiKey }
+    } catch (error) {
+      // 不记录供应商原始错误，避免其响应包含 token；只区分需要重新授权的明确错误。
+      if (error instanceof SubscriptionSecureStorageError) throw error
+      if (isSubscriptionAuthorizationFailure(error)) {
+        throw new SubscriptionAuthorizationError()
+      }
+      throw new Error('订阅目录更新失败')
+    }
+  },
+  commit(snapshot, loaded) {
+    if (loaded.discard) return undefined
+    // await 期间可能切换账号、删除渠道或修改 enabled。只在凭据仍匹配时提交，
+    // 并基于最新 models 合并，绝不覆盖用户在请求期间的操作。
+    const config = readConfig()
+    const index = config.channels.findIndex((channel) => channel.id === snapshot.id)
+    const current = config.channels[index]
+    if (!current || current.provider !== snapshot.provider || current.apiKey !== (loaded.expectedApiKey ?? snapshot.apiKey)) return undefined
+    const models = appendSubscriptionModels(current.models, loaded.models)
+    // OAuth 凭据只由各渠道的续期锁回写；目录提交仅处理模型，不重复加密凭据。
+    if (models.length === current.models.length) return current
+    const updated: Channel = {
+      ...current,
+      models,
+      updatedAt: Date.now(),
+    }
+    config.channels[index] = updated
+    writeConfig(config)
+    return updated
+  },
+})
+
+/** UI 显式打开时按需检查；普通 listChannels、自动化和后台启动不会触发网络请求。 */
+export async function refreshSubscriptionModels(channelIds?: string[], force = false): Promise<SubscriptionModelRefreshResult> {
+  const selected = channelIds ? new Set(channelIds) : undefined
+  const channels = listChannels().filter((channel) => isRefreshableSubscription(channel)
+    && (selected ? selected.has(channel.id) : channel.enabled))
+  // 绕过缓存只用于用户显式点击「获取模型」；自动打开不会重试失效授权。
+  if (force) for (const channel of channels) subscriptionModelRefresher.invalidate(channel.id)
+  const issues = await Promise.all(channels.map((channel) => subscriptionModelRefresher.refresh(channel)))
+  return { channels: listChannels(), issues: issues.filter((issue) => issue !== undefined) }
+}
 
 /**
  * 从供应商 API 拉取可用模型列表

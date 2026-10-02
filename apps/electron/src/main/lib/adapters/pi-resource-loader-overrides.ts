@@ -1,3 +1,5 @@
+import { resolve } from 'node:path'
+
 /**
  * Proma-managed Pi mode deliberately opts out of Pi's ambient local resources.
  *
@@ -32,10 +34,22 @@ export function createPromaProjectInstructionFilesOverride(files: PromaProjectIn
 }
 
 
-/** Keep managed workspace rules ahead of user-project rules in Pi project context. */
+/** 全局规则、受管工作区规则、项目规则按顺序显式注入，并按路径去重。 */
 export function combinePromaInstructionFiles(
   workspaceFile: PromaProjectInstructionFile | undefined,
   projectFiles: PromaProjectInstructionFile[],
+  globalFile?: PromaProjectInstructionFile,
 ): PromaProjectInstructionFile[] {
-  return workspaceFile ? [workspaceFile, ...projectFiles] : projectFiles
+  const files = [
+    ...(globalFile ? [globalFile] : []),
+    ...(workspaceFile ? [workspaceFile] : []),
+    ...projectFiles,
+  ]
+  const seen = new Set<string>()
+  return files.filter((file) => {
+    const key = resolve(file.path)
+    if (seen.has(key)) return false
+    seen.add(key)
+    return true
+  })
 }

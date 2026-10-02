@@ -83,6 +83,7 @@ export async function loginGithubCopilotOAuth(options?: GithubCopilotLoginOption
     return await runWithOAuthProxyScope(async () => {
       const runtime = await sdk.ModelRuntime.create({
         credentials: createEphemeralCredentialStore(),
+        modelsPath: null,
         allowModelNetwork: false,
       })
       const credentials = await runtime.login('github-copilot', 'oauth', {
@@ -122,12 +123,20 @@ export function cancelGithubCopilotOAuthLogin(): void {
 /** 使用 Pi 内置 GitHub Copilot provider 续签 access token，并刷新模型策略。 */
 export async function refreshGithubCopilotOAuth(
   credentials: GithubCopilotOAuthCredentials,
+  force = false,
 ): Promise<GithubCopilotOAuthCredentials> {
   const sdk = await loadPiSdk()
   return runWithOAuthProxyScope(async () => {
-    const store = createEphemeralCredentialStore({ type: 'oauth', ...credentials })
-    const runtime = await sdk.ModelRuntime.create({ credentials: store, allowModelNetwork: false })
-    await runtime.getAuth('github-copilot')
+    // 目录检查必须重新获取当前账号策略，不能继续使用未过期凭据内的旧 ID 快照。
+    // 仅使内存 token 过期以触发续签；不调用 runtime.login，也不启动 device-code。
+    const store = createEphemeralCredentialStore({ type: 'oauth', ...credentials, ...(force ? { expires: 0 } : {}) })
+    const runtime = await sdk.ModelRuntime.create({
+      credentials: store,
+      modelsPath: null,
+      refreshOnCreate: false,
+      allowModelNetwork: false,
+    })
+    await runtime.getAuth('github-copilot', force ? { signal: AbortSignal.timeout(15_000) } : undefined)
     return normalizeCredentials(await store.read('github-copilot'))
   })
 }

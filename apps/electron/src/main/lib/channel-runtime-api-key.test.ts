@@ -45,6 +45,8 @@ beforeAll(async () => {
   tempHome = mkdtempSync(join(os.tmpdir(), 'proma-channel-runtime-key-'))
   process.env.HOME = tempHome
   process.env.PROMA_DEV = '0'
+  const paths = await import('./config-paths')
+  expect(paths.getChannelsPath()).toBe(join(tempHome, '.proma', 'channels.json'))
   channelManager = await import('./channel-manager')
 })
 

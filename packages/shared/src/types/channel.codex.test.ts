@@ -14,6 +14,22 @@ const sample: CodexOAuthCredentials = {
 }
 
 describe('Codex OAuth 凭据序列化', () => {
+  test('Given Pi 临时字段的凭据 When 序列化 Then 只保留业务字段且解析后 CAS 字符串一致', () => {
+    const sdkCredential = { ...sample, type: 'oauth', temporaryMetadata: '不持久化' }
+    const serialized = serializeCodexCredentials(sdkCredential)
+    expect(serialized).toBe(serializeCodexCredentials(sample))
+    expect(serialized).not.toContain('type')
+    expect(serialized).not.toContain('temporaryMetadata')
+    expect(serializeCodexCredentials(parseCodexCredentials(serialized)!)).toBe(serialized)
+  })
+
+  test('Given 属性顺序不同或空 accountId When 序列化 Then 规范化结果与解析保持一致', () => {
+    const reordered = { accountId: sample.accountId, expires: sample.expires, refresh: sample.refresh, access: sample.access }
+    expect(serializeCodexCredentials(reordered)).toBe(serializeCodexCredentials(sample))
+    const emptyAccount = { access: 'a', refresh: 'r', expires: 123, accountId: '' }
+    expect(serializeCodexCredentials(emptyAccount)).toBe(serializeCodexCredentials({ access: 'a', refresh: 'r', expires: 123 }))
+  })
+
   test('Given 凭据 When 序列化再解析 Then 往返一致', () => {
     const round = parseCodexCredentials(serializeCodexCredentials(sample))
     expect(round).toEqual(sample)

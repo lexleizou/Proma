@@ -37,6 +37,7 @@ import type { Api, KnownProvider, Model } from '@earendil-works/pi-ai/compat'
 import type { PiAgentQueryOptions } from './pi-agent-adapter'
 import { rememberXaiOAuthCredentials, refreshXaiOAuthCredentialsSerial } from '../xai-oauth-credentials'
 import { supportsPiDeveloperRole } from './pi-provider-compat'
+import { isCompatibleCodexCatalogModel } from './pi-codex-catalog-compat'
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 type PiAiCompat = typeof import('@earendil-works/pi-ai/compat')
@@ -851,7 +852,8 @@ function isCompleteCatalogModel(model: PiCatalogModelPatch): model is PiCatalogM
   )
 }
 
-function isSupportedCodexModel(model: Pick<PiCatalogModel, 'id'>): boolean {
+function isSupportedCodexModel(model: PiCatalogModel): boolean {
+  if (!isCompatibleCodexCatalogModel(model)) return false
   const modelId = model.id.trim().toLowerCase()
   return !UNSUPPORTED_CODEX_MODEL_IDS.has(modelId)
     && !UNSUPPORTED_CODEX_MODEL_PREFIXES.some((prefix) => modelId === prefix || modelId.startsWith(`${prefix}-`))
@@ -881,6 +883,7 @@ export async function buildCodexModel(sdk: PiSdk, input: CodexModelInput) {
       input.codexOAuthCredentials,
       input.onCodexOAuthCredentialsRefreshed,
     ),
+    modelsPath: null,
     allowModelNetwork: false,
   })
 
@@ -902,16 +905,15 @@ export async function buildCodexModel(sdk: PiSdk, input: CodexModelInput) {
   return { modelRuntime, model }
 }
 
-/**
- * List Codex models through Pi's availability abstraction. Codex currently uses
- * Pi's catalog, while a future provider-level subscription filter will be honored automatically.
- */
+/** 通过 Pi 的账号可用性接口获取 Codex 目录，保留上游过滤及协议兼容校验。 */
 export async function listCodexModels(
   credentials: CodexOAuthCredentials,
+  sdk?: PiSdk,
 ): Promise<{ id: string; name: string }[]> {
-  const sdk = await import('@earendil-works/pi-coding-agent')
-  const modelRuntime = await sdk.ModelRuntime.create({
+  const runtimeSdk = sdk ?? await import('@earendil-works/pi-coding-agent')
+  const modelRuntime = await runtimeSdk.ModelRuntime.create({
     credentials: createCodexRuntimeCredentialStore(credentials),
+    modelsPath: null,
     allowModelNetwork: false,
   })
   return (await modelRuntime.getAvailable('openai-codex'))
@@ -976,6 +978,7 @@ export async function buildGithubCopilotModel(sdk: PiSdk, input: GithubCopilotMo
       input.githubCopilotOAuthCredentials,
       input.onGithubCopilotOAuthCredentialsRefreshed,
     ),
+    modelsPath: null,
     allowModelNetwork: false,
   })
   const resolvedModelId = stripLegacyAgentSdkContextSuffix(input.model)
@@ -995,6 +998,7 @@ export async function listGithubCopilotModels(credentials: GithubCopilotOAuthCre
   const sdk = await import('@earendil-works/pi-coding-agent')
   const modelRuntime = await sdk.ModelRuntime.create({
     credentials: createGithubCopilotRuntimeCredentialStore(credentials),
+    modelsPath: null,
     allowModelNetwork: false,
   })
   return (await modelRuntime.getAvailable('github-copilot')).map((model) => ({ id: model.id, name: model.name }))

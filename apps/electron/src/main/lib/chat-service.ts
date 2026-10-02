@@ -13,6 +13,8 @@
  */
 
 import { randomUUID } from 'node:crypto'
+import { getConfigDir } from './config-paths'
+import { appendPromaGlobalChatInstructions, loadPromaGlobalInstructionFile } from './global-instruction-loader'
 import type { WebContents } from 'electron'
 import { CHAT_IPC_CHANNELS } from '@proma/shared'
 import type { ChatSendInput, ChatMessage, GenerateTitleInput, FileAttachment, ChatToolActivity } from '@proma/shared'
@@ -275,11 +277,14 @@ export async function sendMessage(
     const { tools, systemPromptAppend } = getEnabledTools(enabledToolIds)
 
     // 注入工具系统提示词
-    const effectiveSystemMessage = systemPromptAppend && systemMessage
-      ? systemMessage + systemPromptAppend
-      : systemPromptAppend
-        ? systemPromptAppend
-        : systemMessage
+    const effectiveSystemMessage = appendPromaGlobalChatInstructions(
+      systemPromptAppend && systemMessage
+        ? systemMessage + systemPromptAppend
+        : systemPromptAppend
+          ? systemPromptAppend
+          : systemMessage,
+      loadPromaGlobalInstructionFile(getConfigDir()),
+    )
 
     const proxyUrl = await getEffectiveProxyUrl()
     const fetchFn = getFetchFn(proxyUrl)

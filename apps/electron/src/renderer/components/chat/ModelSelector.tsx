@@ -36,6 +36,7 @@ import { cn } from '@/lib/utils'
 import type { Channel, ModelOption, ProviderType } from '@proma/shared'
 import { ChannelPlanQuotaBadge } from './ChannelPlanQuotaBadge'
 import { getModelSelectorOptionVisualState } from './model-selector-visual-state'
+import { getSubscriptionChannelIds, showSubscriptionModelRefreshIssues } from '@/lib/subscription-model-refresh'
 
 /** 渠道标题与模型项共享的三列栅格，确保左右边距和文字起点一致。 */
 const MODEL_SELECTOR_ROW_LAYOUT =
@@ -146,13 +147,31 @@ export function ModelSelector({
   // 外部模型优先 → per-conversation 模型
   const selectedModel = externalSelectedModel !== undefined ? externalSelectedModel : conversationModel
 
-  // 每次打开 Popover 时刷新渠道列表，确保最新
+  // 父组件可能内联构造数组；按过滤值而非数组引用触发检查，避免 atom 更新引发循环。
+  const refreshScopeKey = JSON.stringify([filterChannelId, filterChannelIds, excludedProviders])
+
+  // 先展示已保存列表，网络检查在主进程按 TTL 去重，失败不影响模型选择。
   React.useEffect(() => {
-    if (open) {
-      window.electronAPI.listChannels().then(setChannels).catch(console.error)
-      setSearch('')
-    }
-  }, [open, setChannels])
+    if (!open) return
+    let cancelled = false
+    setSearch('')
+    void (async () => {
+      const saved = await window.electronAPI.listChannels()
+      if (cancelled) return
+      setChannels(saved)
+      const visible = saved.filter((channel) => channel.enabled
+        && (!filterChannelId || channel.id === filterChannelId)
+        && (!filterChannelIds || filterChannelIds.includes(channel.id))
+        && !excludedProviders?.includes(channel.provider))
+      const ids = getSubscriptionChannelIds(visible)
+      if (ids.length === 0) return
+      const result = await window.electronAPI.refreshSubscriptionModels(ids)
+      if (cancelled) return
+      setChannels(result.channels)
+      showSubscriptionModelRefreshIssues(result)
+    })().catch(console.error)
+    return () => { cancelled = true }
+  }, [open, setChannels, refreshScopeKey])
 
   const modelOptions = React.useMemo(
     () => buildModelOptions(channels, filterChannelId, filterChannelIds, excludedProviders),

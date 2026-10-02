@@ -38,6 +38,7 @@ import type {
   ChannelDirectTestInput,
   FetchModelsInput,
   FetchModelsResult,
+  SubscriptionModelRefreshResult,
   ConversationMeta,
   ChatMessage,
   ChatSendInput,
@@ -187,6 +188,7 @@ import {
   testChannel,
   testChannelDirect,
   fetchModels,
+  refreshSubscriptionModels,
   getChannelById,
   getChannelPlanQuota,
 } from './lib/channel-manager'
@@ -1727,6 +1729,19 @@ export function registerIpcHandlers(): void {
     async (): Promise<Channel[]> => {
       return listChannels()
     }
+  )
+
+  // 仅由打开模型界面的显式请求触发，缓存与凭据处理全部留在主进程。
+  ipcMain.handle(
+    CHANNEL_IPC_CHANNELS.REFRESH_SUBSCRIPTION_MODELS,
+    async (_, channelIds?: unknown, force?: unknown): Promise<SubscriptionModelRefreshResult> => {
+      if (channelIds !== undefined && (!Array.isArray(channelIds)
+        || channelIds.length > 1000 || !channelIds.every((id) => typeof id === 'string'))) {
+        throw new Error('渠道 ID 列表无效')
+      }
+      if (force !== undefined && typeof force !== 'boolean') throw new Error('强制刷新参数无效')
+      return refreshSubscriptionModels(channelIds as string[] | undefined, force === true)
+    },
   )
 
   // 创建渠道

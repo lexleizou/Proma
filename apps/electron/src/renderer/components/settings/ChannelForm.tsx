@@ -24,6 +24,7 @@ import {
   Search,
 } from 'lucide-react'
 import { toast } from 'sonner'
+import { showSubscriptionModelRefreshIssues } from '@/lib/subscription-model-refresh'
 import { useSetAtom } from 'jotai'
 import { channelFormDirtyAtom } from '@/atoms/settings-tab'
 import { cn } from '@/lib/utils'
@@ -209,6 +210,8 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
     normalizeBaseUrl(channel?.baseUrl ?? PROVIDER_DEFAULT_URLS[channel?.provider ?? 'anthropic'])
   ))
   const [apiKey, setApiKey] = React.useState('')
+  // 已加载/保存的凭据不随普通 auto-save 重写，避免覆盖主进程刚续期的 token。
+  const savedApiKeyRef = React.useRef('')
   const [zhipuTeamSecret, setZhipuTeamSecret] = React.useState<ZhipuTeamSecretForm>(EMPTY_ZHIPU_TEAM_SECRET)
   const [showApiKey, setShowApiKey] = React.useState(false)
   const [models, setModels] = React.useState<ChannelModel[]>(channel?.models ?? [])
@@ -278,7 +281,26 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
   /** 编辑模式下加载明文 API Key */
   React.useEffect(() => {
     if (isEdit && channel && !apiKeyLoaded) {
-      window.electronAPI.decryptApiKey(channel.id).then((key) => {
+      let cancelled = false
+      void (async () => {
+        if (channel.provider === 'github-copilot' || channel.provider === 'openai-codex') {
+          try {
+            const result = await window.electronAPI.refreshSubscriptionModels([channel.id])
+            if (cancelled) return
+            const updated = result.channels.find((item) => item.id === channel.id)
+            if (updated) setModels((previous) => {
+              const known = new Set(previous.map((model) => model.id))
+              return [...previous, ...updated.models.filter((model) => !known.has(model.id))]
+            })
+            showSubscriptionModelRefreshIssues(result)
+          } catch {
+            // 刷新失败不阻止查看和编辑上次保存的配置。
+          }
+        }
+        return window.electronAPI.decryptApiKey(channel.id)
+      })().then((key) => {
+        if (cancelled || key === undefined) return
+        savedApiKeyRef.current = key
         setApiKey(key)
         if (channel.provider === 'zhipu-coding-team') {
           setZhipuTeamSecret({ ...EMPTY_ZHIPU_TEAM_SECRET, ...parseZhipuTeamSecret(key) })
@@ -288,9 +310,11 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
         }
         setApiKeyLoaded(true)
       }).catch((error) => {
+        if (cancelled) return
         console.error('[模型配置表单] 解密 API Key 失败:', error)
         setApiKeyLoaded(true)
       })
+      return () => { cancelled = true }
     }
   }, [isEdit, channel, apiKeyLoaded])
 
@@ -344,10 +368,11 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
         name: currentName,
         provider: currentProvider,
         baseUrl: currentBaseUrl,
-        apiKey: currentApiKey || undefined,
+        apiKey: currentApiKey && currentApiKey !== savedApiKeyRef.current ? currentApiKey : undefined,
         models: currentModels,
         enabled: currentEnabled,
       })
+      savedApiKeyRef.current = currentApiKey
       toast.success('已保存', { id: 'auto-save-success' })
     } catch (error) {
       console.error('[模型配置表单] auto-save 失败:', error)
@@ -714,6 +739,21 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
     setFetchResult(null)
 
     try {
+      if (channel && channel.provider === provider && (isCodexProvider || isGithubCopilotProvider)) {
+        const refreshed = await window.electronAPI.refreshSubscriptionModels([channel.id], true)
+        const issue = refreshed.issues.find((item) => item.channelId === channel.id)
+        const updated = refreshed.channels.find((item) => item.id === channel.id)
+        if (issue || !updated) {
+          setFetchResult({ success: false, message: issue?.message ?? '渠道已删除，请返回配置列表', models: [] })
+          return
+        }
+        setModels((previous) => {
+          const known = new Set(previous.map((model) => model.id))
+          return [...previous, ...updated.models.filter((model) => !known.has(model.id))]
+        })
+        setFetchResult({ success: true, message: '模型目录已更新，已保留已有模型的启用状态', models: updated.models })
+        return
+      }
       const result = await window.electronAPI.fetchModels({
         provider,
         baseUrl,
@@ -730,15 +770,26 @@ export function ChannelForm({ channel, onSaved, onCancel }: ChannelFormProps): R
       // 拉取失败时保留现有列表，避免 auto-save 持久化空模型列表
       if (!result.success) return
       const fetchedModels = result.models
+      // 订阅目录也只增加模型，不删除旧条目或重新启用已关闭模型。
+      if (isCodexProvider || isGithubCopilotProvider) {
+        setModels((previous) => {
+          const known = new Set(previous.map((model) => model.id))
+          const additions = fetchedModels.filter((model) => {
+            if (known.has(model.id)) return false
+            known.add(model.id)
+            return true
+          })
+          return [...previous, ...additions.map((model) => ({ ...model, enabled: true }))]
+        })
+        return
+      }
       const fetchedById = new Map(fetchedModels.map((m) => [m.id, m]))
       setModels((prev) => {
         const manualKept = prev.filter((m) => m.source === 'manual' && !fetchedById.has(m.id))
         const merged = fetchedModels.map((m) => {
           const old = prev.find((p) => p.id === m.id)
-          // ChatGPT (Codex) 是 SDK 内置的少量精选模型，拉取即全部启用，
-          // 与登录自动拉取路径（handleCodexLogin）保持一致，避免新模型（如 gpt-5.6 系列）
-          // 默认未启用而沉到「可用模型」折叠区，被误认为"拉不到"。
-          if (isSubscriptionProvider) return { ...m, enabled: true }
+          // 其余订阅渠道（xAI）新增项默认启用，但既有条目仍保留用户状态。
+          if (isSubscriptionProvider) return old ? { ...old } : { ...m, enabled: true }
           return old ? { ...m, enabled: old.enabled } : { ...m, enabled: false }
         })
         return [...manualKept, ...merged]

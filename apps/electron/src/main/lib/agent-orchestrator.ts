@@ -54,7 +54,8 @@ import { appendSDKMessages, updateAgentSessionMeta, getAgentSessionMeta, getAgen
 import { getAgentWorkspace, getProjectFilesPath, getWorkspaceMcpConfig, getWorkspaceAttachedDirectories, getWorkspaceAttachedFiles, getWorkspaceAgentsMdPath, readWorkspaceAgentsMd, getWorkspaceMemoryGuidance, isWorkspaceProjectKnowledgeMaintenanceApproved } from './agent-workspace-manager'
 import { getLocalProjectRootStatus } from './project-root-health'
 import { getMcpApiKeyEnvironment, getMcpOAuthHeaders } from './mcp-oauth-service'
-import { getAgentWorkspacePath, getAgentSessionWorkspacePath, getSdkConfigDir, getWorkspaceSkillsDir } from './config-paths'
+import { loadPromaGlobalInstructionFile } from './global-instruction-loader'
+import { getConfigDir, getAgentWorkspacePath, getAgentSessionWorkspacePath, getSdkConfigDir, getWorkspaceSkillsDir } from './config-paths'
 import { getRuntimeStatus } from './runtime-init'
 import { getSettings } from './settings-service'
 import { buildSystemPrompt, buildDynamicContext } from './agent-prompt-builder'
@@ -346,13 +347,18 @@ export class AgentOrchestrator {
           getEffectiveProxyUrl(),
         ])
         if (signal?.aborted) return null
+        let credentialsSnapshot = credentials
         const generatedTitle = await generateCodexTitle({
           modelId,
           prompt: TITLE_PROMPT + userMessage,
           credentials,
           proxyUrl,
           signal,
-          onCredentialsRefreshed: (refreshed) => persistCodexOAuthCredentials(channelId, refreshed),
+          onCredentialsRefreshed: (refreshed) => {
+            if (persistCodexOAuthCredentials(channelId, refreshed, credentialsSnapshot)) {
+              credentialsSnapshot = { ...refreshed, accountId: refreshed.accountId ?? credentialsSnapshot.accountId }
+            }
+          },
         })
         if (signal?.aborted) return null
         const title = generatedTitle ? sanitizeGeneratedTitle(generatedTitle) : null
@@ -1522,6 +1528,7 @@ export class AgentOrchestrator {
       const instructionFiles = combinePromaInstructionFiles(
         managedWorkspaceInstructionFile,
         projectInstructions?.sources.map(({ path, content }) => ({ path, content })) ?? [],
+        loadPromaGlobalInstructionFile(getConfigDir()),
       )
       // 每次前台对话都基于受管 memory/ 的真实缺口给出渐进引导；自动化、桥接与委派绝不主动追问。
       const projectKnowledgeMaintenanceApproved = workspaceSlug
@@ -1605,6 +1612,7 @@ export class AgentOrchestrator {
         })
       }
       const piCustomTools = [...piBuiltinTools, ...piMcpTools, ...(extensions.piCustomTools ?? [])]
+      let codexCredentialsSnapshot = codexOAuthCredentials
       let githubCopilotCredentialsSnapshot = githubCopilotOAuthCredentials
       const queryOptions: PiAgentQueryOptions = {
         sessionId,
@@ -1648,7 +1656,10 @@ export class AgentOrchestrator {
         ...(codexOAuthCredentials && {
           codexOAuthCredentials,
           onCodexOAuthCredentialsRefreshed: (credentials: CodexOAuthCredentials) => {
-            persistCodexOAuthCredentials(channelId, credentials)
+            const expectedCredentials = codexCredentialsSnapshot
+            if (expectedCredentials && persistCodexOAuthCredentials(channelId, credentials, expectedCredentials)) {
+              codexCredentialsSnapshot = { ...credentials, accountId: credentials.accountId ?? expectedCredentials.accountId }
+            }
           },
         }),
         ...(githubCopilotOAuthCredentials && {

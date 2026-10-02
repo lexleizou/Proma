@@ -18,6 +18,7 @@ import type {
   ChannelDirectTestInput,
   FetchModelsInput,
   FetchModelsResult,
+  SubscriptionModelRefreshResult,
   ChannelPlanQuotaResult,
   CodexOAuthLoginResult,
   XaiOAuthLoginResult,
@@ -303,6 +304,9 @@ export interface ElectronAPI {
 
   /** 获取所有渠道列表（apiKey 保持加密态） */
   listChannels: () => Promise<Channel[]>
+
+  /** 打开模型界面时按需检查订阅目录；不返回明文凭据。 */
+  refreshSubscriptionModels: (channelIds?: string[], force?: boolean) => Promise<SubscriptionModelRefreshResult>
 
   /** 创建渠道（apiKey 为明文，主进程加密） */
   createChannel: (input: ChannelCreateInput) => Promise<Channel>
@@ -1525,6 +1529,9 @@ const electronAPI: ElectronAPI = {
   // 渠道管理
   listChannels: () => {
     return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.LIST)
+  },
+  refreshSubscriptionModels: (channelIds?: string[], force?: boolean) => {
+    return ipcRenderer.invoke(CHANNEL_IPC_CHANNELS.REFRESH_SUBSCRIPTION_MODELS, channelIds, force)
   },
 
   createChannel: (input: ChannelCreateInput) => {
