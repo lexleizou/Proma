@@ -965,6 +965,35 @@ export async function getGithubCopilotCatalogModels(): Promise<PiCatalogModel[]>
   return [...getModels('github-copilot')]
 }
 
+/** Copilot 仅可执行其 provider 已注册的协议及完整模型元数据。 */
+function isCompatibleGithubCopilotModel(model: PiCatalogModel): boolean {
+  return model.provider === 'github-copilot'
+    && ['anthropic-messages', 'openai-completions', 'openai-responses'].includes(model.api)
+    && typeof model.id === 'string' && Boolean(model.id.trim())
+    && typeof model.name === 'string' && Boolean(model.name.trim())
+    && typeof model.baseUrl === 'string' && model.baseUrl.startsWith('https://')
+    && Array.isArray(model.input) && model.input.includes('text')
+    && Boolean(model.cost)
+    && [model.cost.input, model.cost.output, model.cost.cacheRead, model.cost.cacheWrite].every(Number.isFinite)
+    && Number.isFinite(model.contextWindow) && model.contextWindow > 0
+    && Number.isFinite(model.maxTokens) && model.maxTokens > 0
+}
+
+/** 仅更新 Copilot 官方在线元数据；不会向目录服务发送订阅凭据。 */
+async function refreshGithubCopilotCatalog(modelRuntime: Awaited<ReturnType<PiSdk['ModelRuntime']['create']>>): Promise<void> {
+  const { runWithOAuthProxyScope } = await import('../oauth-proxy-scope')
+  const result = await runWithOAuthProxyScope(() => modelRuntime.refresh({
+    providers: ['github-copilot'],
+    allowNetwork: true,
+    force: true,
+    signal: AbortSignal.timeout(15_000),
+  }))
+  const failure = result.errors.get('github-copilot')
+  if (result.aborted || failure) {
+    throw new Error('GitHub Copilot 模型目录暂时无法更新，请稍后重试', { cause: failure })
+  }
+}
+
 /**
  * GitHub Copilot 的模型可见性由订阅套餐、组织策略和已启用模型决定。
  * 因此必须用携带凭据的 ModelRuntime 读取过滤后的目录，不能退回全量 catalog。
@@ -973,16 +1002,30 @@ export async function buildGithubCopilotModel(sdk: PiSdk, input: GithubCopilotMo
   if (!input.githubCopilotOAuthCredentials) {
     throw new Error('GitHub Copilot 登录凭据无效或缺失，请重新登录')
   }
+  const credentials = createGithubCopilotRuntimeCredentialStore(
+    input.githubCopilotOAuthCredentials,
+    input.onGithubCopilotOAuthCredentialsRefreshed,
+  )
   const modelRuntime = await sdk.ModelRuntime.create({
-    credentials: createGithubCopilotRuntimeCredentialStore(
-      input.githubCopilotOAuthCredentials,
-      input.onGithubCopilotOAuthCredentialsRefreshed,
-    ),
+    credentials,
     modelsPath: null,
     allowModelNetwork: false,
   })
   const resolvedModelId = stripLegacyAgentSdkContextSuffix(input.model)
-  const availableModels = await modelRuntime.getAvailable('github-copilot')
+  let availableModels = (await modelRuntime.getAvailable('github-copilot')).filter(isCompatibleGithubCopilotModel)
+  if (resolvedModelId && !availableModels.some((candidate) => candidate.id === resolvedModelId)) {
+    // SDK 可能已续签并更新账号策略，必须读取最新内存凭据，而非输入快照。
+    const current = await credentials.read('github-copilot')
+    if (current?.availableModelIds?.includes(resolvedModelId)) {
+      await refreshGithubCopilotCatalog(modelRuntime)
+      availableModels = (await modelRuntime.getAvailable('github-copilot')).filter(isCompatibleGithubCopilotModel)
+      const latest = await credentials.read('github-copilot')
+      if (latest?.availableModelIds?.includes(resolvedModelId)
+        && !availableModels.some((candidate) => candidate.id === resolvedModelId)) {
+        throw new Error(`GitHub Copilot 账号已允许模型 ${resolvedModelId}，但在线目录尚无可执行元数据，请稍后重试`)
+      }
+    }
+  }
   const model = resolvedModelId
     ? availableModels.find((candidate) => candidate.id === resolvedModelId)
     : availableModels[0]
@@ -994,14 +1037,23 @@ export async function buildGithubCopilotModel(sdk: PiSdk, input: GithubCopilotMo
 }
 
 /** 列出当前 GitHub Copilot 凭据实际允许使用的模型。 */
-export async function listGithubCopilotModels(credentials: GithubCopilotOAuthCredentials): Promise<{ id: string; name: string }[]> {
-  const sdk = await import('@earendil-works/pi-coding-agent')
+export async function listGithubCopilotModels(credentials: GithubCopilotOAuthCredentials, sdkOverride?: PiSdk): Promise<{ id: string; name: string }[]> {
+  const sdk = sdkOverride ?? await import('@earendil-works/pi-coding-agent')
+  const credentialStore = createGithubCopilotRuntimeCredentialStore(credentials)
   const modelRuntime = await sdk.ModelRuntime.create({
-    credentials: createGithubCopilotRuntimeCredentialStore(credentials),
+    credentials: credentialStore,
     modelsPath: null,
+    refreshOnCreate: false,
     allowModelNetwork: false,
   })
-  return (await modelRuntime.getAvailable('github-copilot')).map((model) => ({ id: model.id, name: model.name }))
+  await refreshGithubCopilotCatalog(modelRuntime)
+  const availableModels = (await modelRuntime.getAvailable('github-copilot')).filter(isCompatibleGithubCopilotModel)
+  const current = await credentialStore.read('github-copilot')
+  // 部分尚不支持的型号不能阻止追加其他可执行型号；全部缺元数据时则明确失败。
+  if (availableModels.length === 0 && current?.availableModelIds?.length) {
+    throw new Error('GitHub Copilot 账号允许的部分模型尚缺可执行目录元数据，请稍后重试')
+  }
+  return availableModels.map((model) => ({ id: model.id, name: model.name }))
 }
 
 export async function buildModel(sdk: PiSdk, input: PiAgentQueryOptions) {

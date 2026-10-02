@@ -57,11 +57,24 @@ beforeAll(async () => {
   expect(paths.getChannelsPath()).toBe(join(tempHome, '.proma', 'channels.json'))
   const registry = await import('./adapters/pi-model-registry')
   const listCopilot = registry.listGithubCopilotModels
+  const sdk = await import('@earendil-works/pi-coding-agent')
+  // 持久化 fixture 保留真实 SDK 的账号筛选，但不依赖外部目录网络。
+  const offlineSdk = {
+    ModelRuntime: {
+      create: async (input: Parameters<typeof sdk.ModelRuntime.create>[0]) => {
+        const runtime = await sdk.ModelRuntime.create(input)
+        const refresh = runtime.refresh.bind(runtime)
+        runtime.refresh = (options) => refresh({ ...options, allowNetwork: false })
+        return runtime
+      },
+    },
+  } as unknown as typeof sdk
+  mock.module('./oauth-proxy-scope', () => ({ runWithOAuthProxyScope: async (operation: () => Promise<unknown>) => operation() }))
   mock.module('./adapters/pi-model-registry', () => ({
     ...registry,
     listGithubCopilotModels: async (credential: GithubCopilotOAuthCredentials) => {
       modelReadCalls++
-      const models = await listCopilot(credential)
+      const models = await listCopilot(credential, offlineSdk)
       await afterCopilotList(credential)
       return models
     },
