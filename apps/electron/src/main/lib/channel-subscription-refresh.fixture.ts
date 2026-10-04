@@ -57,8 +57,9 @@ beforeAll(async () => {
   expect(paths.getChannelsPath()).toBe(join(tempHome, '.proma', 'channels.json'))
   const registry = await import('./adapters/pi-model-registry')
   const listCopilot = registry.listGithubCopilotModels
+  const listCodex = registry.listCodexModels
   const sdk = await import('@earendil-works/pi-coding-agent')
-  // 持久化 fixture 保留真实 SDK 的账号筛选，但不依赖外部目录网络。
+  // 持久化 fixture 使用真实 SDK，但关闭在线目录，避免测试依赖网络或真实配置。
   const offlineSdk = {
     ModelRuntime: {
       create: async (input: Parameters<typeof sdk.ModelRuntime.create>[0]) => {
@@ -72,6 +73,7 @@ beforeAll(async () => {
   mock.module('./oauth-proxy-scope', () => ({ runWithOAuthProxyScope: async (operation: () => Promise<unknown>) => operation() }))
   mock.module('./adapters/pi-model-registry', () => ({
     ...registry,
+    listCodexModels: async (credential: CodexOAuthCredentials) => listCodex(credential, offlineSdk),
     listGithubCopilotModels: async (credential: GithubCopilotOAuthCredentials) => {
       modelReadCalls++
       const models = await listCopilot(credential, offlineSdk)

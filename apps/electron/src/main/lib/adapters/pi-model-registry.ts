@@ -914,8 +914,11 @@ export async function listCodexModels(
   const modelRuntime = await runtimeSdk.ModelRuntime.create({
     credentials: createCodexRuntimeCredentialStore(credentials),
     modelsPath: null,
+    refreshOnCreate: false,
     allowModelNetwork: false,
   })
+  await refreshCodexCatalog(modelRuntime)
+  // 刷新后重新询问带凭据的 runtime，不能用公开目录自行追加账号未授权的型号。
   return (await modelRuntime.getAvailable('openai-codex'))
     .filter(isSupportedCodexModel)
     .map((model) => ({ id: model.id, name: model.name }))
@@ -963,6 +966,21 @@ export async function listXaiModels(): Promise<{ id: string; name: string }[]> {
 export async function getGithubCopilotCatalogModels(): Promise<PiCatalogModel[]> {
   const { getModels } = await loadPiAiCompat()
   return [...getModels('github-copilot')]
+}
+
+/** 仅更新 Codex 官方在线元数据；公开目录请求不会携带订阅凭据。 */
+async function refreshCodexCatalog(modelRuntime: Awaited<ReturnType<PiSdk['ModelRuntime']['create']>>): Promise<void> {
+  const { runWithOAuthProxyScope } = await import('../oauth-proxy-scope')
+  const result = await runWithOAuthProxyScope(() => modelRuntime.refresh({
+    providers: ['openai-codex'],
+    allowNetwork: true,
+    force: true,
+    signal: AbortSignal.timeout(15_000),
+  }))
+  const failure = result.errors.get('openai-codex')
+  if (result.aborted || failure) {
+    throw new Error('ChatGPT (Codex) 模型目录暂时无法更新，请稍后重试', { cause: failure })
+  }
 }
 
 /** Copilot 仅可执行其 provider 已注册的协议及完整模型元数据。 */

@@ -1,7 +1,11 @@
-import { describe, expect, test } from 'bun:test'
+import { describe, expect, mock, test } from 'bun:test'
 import type { Api, Model } from '@earendil-works/pi-ai/compat'
 import { isCompatibleCodexCatalogModel, withLocalCodexSolCompatibility } from './pi-codex-catalog-compat'
-import { buildCodexModel, getCodexCatalogModels, listCodexModels } from './pi-model-registry'
+mock.module('../oauth-proxy-scope', () => ({
+  runWithOAuthProxyScope: async (operation: () => Promise<unknown>) => operation(),
+}))
+
+const { buildCodexModel, getCodexCatalogModels, listCodexModels } = await import('./pi-model-registry')
 
 type PiSdk = typeof import('@earendil-works/pi-coding-agent')
 const model: Model<Api> = {
@@ -12,7 +16,11 @@ const model: Model<Api> = {
 const credentials = { access: 'test', refresh: 'test', expires: Date.now() + 3600000 }
 
 function runtimeSdk(models: Model<Api>[]): PiSdk {
-  return { ModelRuntime: { create: async () => ({ getModels: () => models }) } } as unknown as PiSdk
+  return { ModelRuntime: { create: async () => ({
+    getModels: () => models,
+    getAvailable: async () => models,
+    refresh: async () => ({ aborted: false, errors: new Map() }),
+  }) } } as unknown as PiSdk
 }
 
 describe('Codex 目录运行时兼容性', () => {
@@ -106,15 +114,58 @@ describe('Codex 目录运行时兼容性', () => {
     }) => {
       expect(input.modelsPath).toBeNull()
       expect(await input.credentials.read('openai-codex')).toEqual({ type: 'oauth', ...credentials })
-      return { getAvailable: async (provider: string) => {
-        expect(provider).toBe('openai-codex')
-        return [model, { ...model, id: 'gpt-5.5' }, { ...model, id: 'invalid', api: 'openai-responses' }]
-      } }
+      return {
+        refresh: async () => ({ aborted: false, errors: new Map() }),
+        getAvailable: async (provider: string) => {
+          expect(provider).toBe('openai-codex')
+          return [model, { ...model, id: 'gpt-5.5' }, { ...model, id: 'invalid', api: 'openai-responses' }]
+        },
+      }
     } } } as unknown as PiSdk
-    expect(await listCodexModels(credentials, sdk)).toEqual([{ id: 'gpt-6-sol', name: 'GPT-6 Sol' }])
+    const result = await listCodexModels(credentials, sdk)
+    expect(result.map((entry) => entry.id)).toEqual(['gpt-6-sol'])
   })
   test('Given 账号没有可用模型 When 拉取目录 Then 空目录是成功结果', async () => {
-    const sdk = { ModelRuntime: { create: async () => ({ getAvailable: async () => [] }) } } as unknown as PiSdk
-    expect(await listCodexModels(credentials, sdk)).toEqual([])
+    const sdk = { ModelRuntime: { create: async () => ({
+      refresh: async () => ({ aborted: false, errors: new Map() }),
+      getAvailable: async () => [],
+    }) } } as unknown as PiSdk
+    const result = await listCodexModels(credentials, sdk)
+    expect(result).toEqual([])
+  })
+  test('Given 在线目录新增6.1 Sol When 拉取目录 Then 刷新后只返回账号可用模型', async () => {
+    const native = {
+      ...model, id: 'gpt-6.1-sol', name: 'GPT-6.1 Sol', contextWindow: 272000,
+    }
+    const sdk = runtimeSdk([])
+    let available = [model]
+    sdk.ModelRuntime.create = (async () => ({
+      getAvailable: async () => available,
+      refresh: async (options: { providers?: string[]; allowNetwork?: boolean; force?: boolean; signal?: AbortSignal }) => {
+        expect(options).toMatchObject({ providers: ['openai-codex'], allowNetwork: true, force: true })
+        available = [model, native]
+        return { aborted: false, errors: new Map() }
+      },
+    })) as unknown as typeof sdk.ModelRuntime.create
+    expect(await listCodexModels(credentials, sdk)).toEqual([
+      { id: model.id, name: model.name }, { id: native.id, name: native.name },
+    ])
+  })
+  test('Given 目录包括6.1 Sol但账号只准其他型号 When 获取 Then 不自行补回未获准模型', async () => {
+    const sdk = runtimeSdk([])
+    sdk.ModelRuntime.create = (async () => ({
+      getAvailable: async () => [model],
+      refresh: async () => ({ aborted: false, errors: new Map() }),
+    })) as unknown as typeof sdk.ModelRuntime.create
+    expect(await listCodexModels(credentials, sdk)).toEqual([{ id: model.id, name: model.name }])
+  })
+  test('Given 远程目录请求失败 When 拉取目录 Then 明确失败以便上层保留已有模型', async () => {
+    const sdk = runtimeSdk([model])
+    sdk.ModelRuntime.create = (async () => ({
+      getModels: () => [model],
+      getAvailable: async () => [model],
+      refresh: async () => ({ aborted: false, errors: new Map([['openai-codex', new Error('offline')]]) }),
+    })) as unknown as typeof sdk.ModelRuntime.create
+    await expect(listCodexModels(credentials, sdk)).rejects.toThrow('模型目录暂时无法更新')
   })
 })
